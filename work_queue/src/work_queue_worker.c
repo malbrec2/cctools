@@ -116,6 +116,9 @@ static int max_backoff_interval = 60;
 // Chance that a worker will decide to shut down each minute without warning, to simulate failure.
 static double worker_volatility = 0.0;
 
+static double worker_sleepiness = 0.0;
+static double worker_sleep_factor = 0.3;
+
 // Flag gets set on receipt of a terminal signal.
 static int abort_flag = 0;
 
@@ -144,6 +147,9 @@ static char *arch_name = NULL;
 static char *user_specified_workdir = NULL;
 static time_t worker_start_time = 0;
 static char *base_debug_filename = NULL;
+
+static timestamp_t total_master_transfer_time = 0;
+static int total_master_bytes_transferred = 0;
 
 // Local resource controls
 static struct work_queue_resources * local_resources = 0;
@@ -423,13 +429,28 @@ static void report_task_complete(struct link *master, struct task_info *ti, stru
 {
 	INT64_T output_length;
 	struct stat st;
+	timestamp_t transfer_time;
 
 	if(ti) {
 		fstat(ti->output_fd, &st);
 		output_length = st.st_size;
 		lseek(ti->output_fd, 0, SEEK_SET);
+
+
 		send_master_message(master, "result %d %lld %llu %d\n", ti->status, output_length, ti->execution_end-ti->execution_start, ti->taskid);
+		
+		if(worker_sleepiness &&  (double)rand()/(double)RAND_MAX < worker_sleepiness) {
+			double master_bw = (double)total_master_bytes_transferred / ((double)total_master_transfer_time / 1000000.0);
+			debug(D_NOTICE, "work_queue_worker: disconnect from master due to volatility check.\n");
+			sleep(output_length / master_bw * worker_sleep_factor);
+		}
+		
+		transfer_time = timestamp_get();
 		link_stream_from_fd(master, ti->output_fd, output_length, time(0)+active_timeout);
+		transfer_time = timestamp_get() - transfer_time;
+		
+		total_master_transfer_time += transfer_time;
+		total_master_bytes_transferred += output_length;
 		
 		cores_allocated -= ti->task->cores;
 		memory_allocated -= ti->task->memory;
@@ -833,6 +854,7 @@ static int stream_output_item(struct link *master, const char *filename, int rec
 	struct stat info;
 	INT64_T actual, length;
 	int fd;
+	timestamp_t transfer_time;
 
 	sprintf(cached_filename, "cache/%s", filename);
 
@@ -862,12 +884,25 @@ static int stream_output_item(struct link *master, const char *filename, int rec
 		if(fd >= 0) {
 			length = (INT64_T) info.st_size;
 			send_master_message(master, "file %s %lld\n", filename, length);
+			
+			if(worker_sleepiness &&  (double)rand()/(double)RAND_MAX < worker_sleepiness) {
+				double master_bw = (double)total_master_bytes_transferred / ((double)total_master_transfer_time / 1000000.0);
+				debug(D_NOTICE, "work_queue_worker: disconnect from master due to volatility check.\n");
+				sleep(length / master_bw * worker_sleep_factor);
+			}
+			
+			transfer_time = timestamp_get();
 			actual = link_stream_from_fd(master, fd, length, time(0) + active_timeout);
+			transfer_time = timestamp_get() - transfer_time;
+			
 			close(fd);
 			if(actual != length) {
 				debug(D_WQ, "Sending back output file - %s failed: bytes to send = %lld and bytes actually sent = %lld.", filename, length, actual);
 				return 0;
 			}
+			total_master_transfer_time += transfer_time;
+			total_master_bytes_transferred += length;
+			
 		} else {
 			goto failure;
 		}
@@ -1012,6 +1047,7 @@ static int do_task( struct link *master, int taskid )
 static int do_put(struct link *master, char *filename, INT64_T length, int mode) {
 	char cached_filename[WORK_QUEUE_LINE_MAX];
 	char *cur_pos;
+	timestamp_t transfer_time;
 	
 	debug(D_WQ, "Putting file %s into workspace\n", filename);
 	if(!check_disk_space_for_filesize(length)) {
@@ -1046,12 +1082,24 @@ static int do_put(struct link *master, char *filename, INT64_T length, int mode)
 		return 0;
 	}
 
+	if(worker_sleepiness &&  (double)rand()/(double)RAND_MAX < worker_sleepiness) {
+		double master_bw = (double)total_master_bytes_transferred / ((double)total_master_transfer_time / 1000000.0);
+		debug(D_NOTICE, "work_queue_worker: disconnect from master due to volatility check.\n");
+		sleep(length / master_bw * worker_sleep_factor);
+	}
+	
+	transfer_time = timestamp_get();
 	INT64_T actual = link_stream_to_fd(master, fd, length, time(0) + active_timeout);
+	transfer_time = timestamp_get() - transfer_time;
+	
 	close(fd);
 	if(actual != length) {
 		debug(D_WQ, "Failed to put file - %s (%s)\n", filename, strerror(errno));
 		return 0;
 	}
+	
+	total_master_transfer_time += transfer_time;
+	total_master_bytes_transferred += length;
 
 	return 1;
 }
@@ -1820,7 +1868,7 @@ static int setup_workspace() {
 }
 
 
-enum {LONG_OPT_DEBUG_FILESIZE = 1, LONG_OPT_VOLATILITY, LONG_OPT_BANDWIDTH,
+enum {LONG_OPT_DEBUG_FILESIZE = 1, LONG_OPT_VOLATILITY, LONG_OPT_SLEEPINESS, LONG_OPT_BANDWIDTH,
       LONG_OPT_DEBUG_RELEASE, LONG_OPT_SPECIFY_LOG, LONG_OPT_CORES, LONG_OPT_MEMORY,
       LONG_OPT_DISK, LONG_OPT_FOREMAN, LONG_OPT_DISABLE_SYMLINKS};
 
@@ -1849,6 +1897,7 @@ struct option long_options[] = {
 	{"os",                  required_argument,  0,  'O'},
 	{"workdir",             required_argument,  0,  's'},
 	{"volatility",          required_argument,  0,  LONG_OPT_VOLATILITY},
+	{"sleepiness",		required_argument,  0,  LONG_OPT_SLEEPINESS},
 	{"bandwidth",           required_argument,  0,  LONG_OPT_BANDWIDTH},
 	{"cores",               required_argument,  0,  LONG_OPT_CORES},
 	{"memory",              required_argument,  0,  LONG_OPT_MEMORY},
@@ -2008,6 +2057,9 @@ int main(int argc, char *argv[])
 			break;
 		case LONG_OPT_VOLATILITY:
 			worker_volatility = atof(optarg);
+			break;
+		case LONG_OPT_SLEEPINESS:
+			worker_sleepiness = atof(optarg);
 			break;
 		case LONG_OPT_BANDWIDTH:
 			setenv("WORK_QUEUE_BANDWIDTH", optarg, 1);

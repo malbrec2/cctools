@@ -1013,7 +1013,7 @@ static int fetch_output_from_worker(struct work_queue *q, struct work_queue_work
 	return 1;
 
       failure:
-	debug(D_WQ, "Failed to receive output from worker %s (%s).", w->hostname, w->addrport);
+	debug(D_WQ, "Failed to receive output from worker %s (%s) for task %d.", w->hostname, w->addrport, taskid);
 	remove_worker(q, w);
 	return 0;
 }
@@ -1796,9 +1796,9 @@ static int send_input_files(struct work_queue_task *t, struct work_queue_worker 
 
       failure:
 	if(tf->type == WORK_QUEUE_FILE || tf->type == WORK_QUEUE_FILE_PIECE)
-		debug(D_WQ, "%s (%s) failed to send %s (%"PRId64" bytes received).", w->hostname, w->addrport, tf->payload, actual);
+		debug(D_WQ, "%s (%s) failed to send %s for task %d (%"PRId64" bytes received).", w->hostname, w->addrport, tf->payload, t->taskid, actual);
 	else
-		debug(D_WQ, "%s (%s) failed to send literal data (%"PRId64" bytes received).", w->hostname, w->addrport, actual);
+		debug(D_WQ, "%s (%s) failed to send literal data for task %d (%"PRId64" bytes received).", w->hostname, w->addrport, t->taskid, actual);
 	t->result |= WORK_QUEUE_RESULT_INPUT_FAIL;
 	return 0;
 }
