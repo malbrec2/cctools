@@ -449,6 +449,7 @@ static timestamp_t get_transfer_wait_time(struct work_queue *q, struct work_queu
 	debug(D_WQ, "refill_time: %lld", (long long) refill_time);
 	
 	current_time = timestamp_get();
+	rerun_time = 0;
 	itable_firstkey(w->current_tasks);
 	while(itable_nextkey(w->current_tasks, &taskid, (void **)&tk)) {
 		rerun_time = MAX(rerun_time, current_time - tk->time_task_submit);
