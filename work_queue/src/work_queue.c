@@ -434,18 +434,27 @@ static timestamp_t get_transfer_wait_time(struct work_queue *q, struct work_queu
 	transfer_time = MAX(worker_transfer_time, retry_transfer_time);
 	transfer_time = MAX(transfer_time, min_transfer_time);
 	
+	debug(D_WQ, "worker_transfer_time: %lld\tretry_transfer_time: %lld\tmin_transfer_time: %lld", (long long)worker_transfer_time, (long long)retry_transfer_time, (long long)min_transfer_time);
+	debug(D_WQ, "transfer_time: %lld", (long long)transfer_time);
+	
 	work_factor = (long double) itable_size(w->current_tasks) / (long double) (itable_size(q->running_tasks) + itable_size(q->finished_tasks));
+	
+	debug(D_WQ, "work_factor: %Lf", work_factor);
 	
 	hash_table_firstkey(w->current_files);
 	while(hash_table_nextkey(w->current_files, &filename, (void **)&tf)) {
 		refill_time += tf->st_size / MAX(worker_transfer_rate, minimum_transfer_rate);
 	}
 	
-	current_time = 0;
+	debug(D_WQ, "refill_time: %lld", (long long) refill_time);
+	
+	current_time = timestamp_get();
 	itable_firstkey(w->current_tasks);
 	while(itable_nextkey(w->current_tasks, &taskid, (void **)&tk)) {
 		rerun_time = MAX(rerun_time, current_time - tk->time_task_submit);
 	}
+	
+	debug(D_WQ, "rerun_time: %lld", (long long)rerun_time);
 	
 	timeout = work_factor * (refill_time + rerun_time) + transfer_timeout_fudge_factor * transfer_time;
 
