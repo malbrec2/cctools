@@ -101,8 +101,6 @@ static const char *work_queue_state_names[] = {"init","ready","busy","full","non
 
 double wq_option_fast_abort_multiplier = -1.0;
 int wq_option_scheduler = WORK_QUEUE_SCHEDULE_TIME;
-int wq_minimum_transfer_timeout = 3;
-int wq_foreman_transfer_timeout = 3600;
 
 struct work_queue {
 	char *name;
@@ -235,8 +233,6 @@ static int short_timeout = 5;
 
 static timestamp_t link_poll_end; //tracks when we poll link; used to timeout unacknowledged keepalive checks
 
-static int tolerable_transfer_rate_denominator = 10;
-static long double minimum_allowed_transfer_rate = 100000;	// 100 KB/s
 
 
 
@@ -403,42 +399,55 @@ static double get_idle_percentage(struct work_queue *q)
 	return (long double) (q->accumulated_idle_time + q->idle_time) / (timestamp_get() - accumulated_idle_start);
 }
 
-static timestamp_t get_transfer_wait_time(struct work_queue *q, struct work_queue_worker *w, int taskid, INT64_T length)
+
+static double transfer_timeout_fudge_factor = 1.25;
+static long double minimum_transfer_rate = 100000;    // 100 KB/s
+static timestamp_t minimum_transfer_timeout = 3000000;  // 3 Seconds
+
+static timestamp_t get_transfer_wait_time(struct work_queue *q, struct work_queue_worker *w, struct work_queue_task *t, INT64_T length)
 {
-	timestamp_t timeout;
-	long double avg_queue_transfer_rate, avg_worker_transfer_rate, retry_transfer_rate, tolerable_transfer_rate;
-	INT64_T total_tasks_complete, total_tasks_running, total_tasks_waiting, num_of_free_workers;
-	struct work_queue_task *t = NULL;
+	timestamp_t timeout, transfer_time, worker_transfer_time, retry_transfer_time, min_transfer_time, refill_time, rerun_time, current_time;
+	long double work_factor, worker_transfer_rate;
+	char *filename;
+	struct stat *tf;
+	UINT64_T taskid;
+	struct work_queue_task *tk;
 	
-	t = itable_lookup(w->current_tasks, taskid);
-
 	if(w->total_transfer_time) {
-		avg_worker_transfer_rate = (long double) w->total_bytes_transferred / w->total_transfer_time * 1000000;
+		worker_transfer_rate = (long double) w->total_bytes_transferred / (long double)(w->total_transfer_time / 1000000);
+		worker_transfer_time = (long double) length / worker_transfer_rate;
 	} else {
-		avg_worker_transfer_rate = 0;
+		worker_transfer_time = 0;
 	}
-
-	retry_transfer_rate = 0;
-	num_of_free_workers = q->workers_in_state[WORKER_STATE_INIT] + q->workers_in_state[WORKER_STATE_READY];
-	total_tasks_complete = q->total_tasks_complete;
-	total_tasks_running = itable_size(q->running_tasks) + itable_size(q->finished_tasks);
-	total_tasks_waiting = list_size(q->ready_list);
-	if(total_tasks_complete > total_tasks_running && num_of_free_workers > total_tasks_waiting) {
+	
+	retry_transfer_time = 0;
+	if(q->total_tasks_complete > itable_size(q->running_tasks) + itable_size(q->finished_tasks) && hash_table_size(q->worker_table) > list_size(q->ready_list)) {
 		// The master has already tried most of the workers connected and has free workers for retrying slow workers
 		if(t && t->total_bytes_transferred) {
-			avg_queue_transfer_rate = (long double) (q->total_bytes_sent + q->total_bytes_received) / (q->total_send_time + q->total_receive_time) * 1000000;
-			retry_transfer_rate = (long double) length / t->total_bytes_transferred * avg_queue_transfer_rate;
+			long double queue_transfer_rate = (long double) (q->total_bytes_sent + q->total_bytes_received) / ( (q->total_send_time + q->total_receive_time)/1000000 );
+			retry_transfer_time = (long double) length / queue_transfer_rate;
 		}
 	}
-
-	tolerable_transfer_rate = MAX(avg_worker_transfer_rate / tolerable_transfer_rate_denominator, retry_transfer_rate);
-	tolerable_transfer_rate = MAX(minimum_allowed_transfer_rate, tolerable_transfer_rate);
-
-	if(!strcmp(w->os, "foreman")) {
-		timeout = MAX(wq_foreman_transfer_timeout, length / tolerable_transfer_rate);
-	} else {
-		timeout = MAX(wq_minimum_transfer_timeout, length / tolerable_transfer_rate);	// try at least wq_minimum_transfer_timeout seconds
+	
+	min_transfer_time = MAX( (long double) length / minimum_transfer_rate, minimum_transfer_timeout);
+	
+	transfer_time = MAX(worker_transfer_time, retry_transfer_time);
+	transfer_time = MAX(transfer_time, min_transfer_time);
+	
+	work_factor = (long double) itable_size(w->current_tasks) / (long double) (itable_size(q->running_tasks) + itable_size(q->finished_tasks));
+	
+	hash_table_firstkey(w->current_files);
+	while(hash_table_nextkey(w->current_files, &filename, (void **)&tf)) {
+		refill_time += tf->st_size / MAX(worker_transfer_rate, minimum_transfer_rate);
 	}
+	
+	current_time = 0;
+	itable_firstkey(w->current_tasks);
+	while(itable_nextkey(w->current_tasks, &taskid, (void **)&tk)) {
+		rerun_time = MAX(rerun_time, current_time - tk->time_task_submit);
+	}
+	
+	timeout = work_factor * (refill_time + rerun_time) + transfer_timeout_fudge_factor * transfer_time;
 
 	debug(D_WQ, "%s (%s) will try up to %lld seconds for the transfer of this %.3Lf MB file.", w->hostname, w->addrport, (long long) timeout, (long double) length / 1000000);
 	return timeout;
@@ -695,7 +704,7 @@ static int get_output_item(char *remote_name, char *local_name, struct work_queu
 					if(q->bandwidth) {
 						effective_stoptime = ((length * 8)/q->bandwidth)*1000000 + timestamp_get();
 					}
-					stoptime = time(0) + get_transfer_wait_time(q, w, t->taskid, length);
+					stoptime = time(0) + get_transfer_wait_time(q, w, t, length);
 					actual = link_stream_to_fd(w->link, fd, length, stoptime);
 					close(fd);
 					if(actual != length) {
@@ -1081,7 +1090,7 @@ static int process_result(struct work_queue *q, struct work_queue_worker *w, con
 	t = itable_lookup(w->current_tasks, taskid);
 	if(!t) {
 	  debug(D_WQ, "Unknown task result from worker %s (%s): no task %" PRId64" assigned to worker.  Ignoring result.", w->hostname, w->addrport, taskid);
-		stoptime = time(0) + get_transfer_wait_time(q, w, -1, (INT64_T) output_length);
+		stoptime = time(0) + get_transfer_wait_time(q, w, NULL, (INT64_T) output_length);
 		link_soak(w->link, output_length, stoptime);
 		return 0;
 	}
@@ -1102,7 +1111,7 @@ static int process_result(struct work_queue *q, struct work_queue_worker *w, con
 	t->output = malloc(output_length + 1);
 	if(output_length > 0) {
 		debug(D_WQ, "Receiving stdout of task %"PRId64" (size: %"PRId64" bytes) from %s (%s) ...", taskid, output_length, w->addrport, w->hostname);
-		stoptime = time(0) + get_transfer_wait_time(q, w, t->taskid, (INT64_T) output_length);
+		stoptime = time(0) + get_transfer_wait_time(q, w, t, (INT64_T) output_length);
 		actual = link_read(w->link, t->output, output_length, stoptime);
 		if(actual != output_length) {
 			debug(D_WQ, "Failure: actual received stdout size (%"PRId64" bytes) is different from expected (%"PRId64" bytes).", actual, output_length);
@@ -1452,7 +1461,7 @@ static int put_file(const char *localname, const char *remotename, off_t offset,
 		effective_stoptime = ((length * 8)/q->bandwidth)*1000000 + timestamp_get();
 	}
 	
-	stoptime = time(0) + get_transfer_wait_time(q, w, t->taskid, length);
+	stoptime = time(0) + get_transfer_wait_time(q, w, t, length);
 	send_worker_msg(w, "put %s %"PRId64" 0%o %d\n", time(0) + short_timeout, remotename, length, local_info.st_mode, flags);
 	actual = link_stream_from_fd(w->link, fd, length, stoptime);
 	close(fd);
@@ -1705,7 +1714,7 @@ static int send_input_files(struct work_queue_task *t, struct work_queue_worker 
 					effective_stoptime = ((tf->length * 8)/q->bandwidth)*1000000 + timestamp_get();
 				}
 				
-				stoptime = time(0) + get_transfer_wait_time(q, w, t->taskid, (INT64_T) fl);
+				stoptime = time(0) + get_transfer_wait_time(q, w, t, (INT64_T) fl);
 				open_time = timestamp_get();
 				send_worker_msg(w, "put %s %"PRId64" %o %d\n", time(0) + short_timeout, remote_name, (INT64_T) fl, 0777, tf->flags);
 				actual = link_putlstring(w->link, tf->payload, fl, stoptime);
@@ -3471,10 +3480,10 @@ int work_queue_tune(struct work_queue *q, const char *name, double value)
 		q->asynchrony_modifier = MAX(value, 0);
 		
 	} else if(!strcmp(name, "min-transfer-timeout")) {
-		wq_minimum_transfer_timeout = (int)value;
+		minimum_transfer_timeout = (int)value;
 	
 	} else if(!strcmp(name, "foreman-transfer-timeout")) {
-		wq_foreman_transfer_timeout = (int)value;
+		minimum_transfer_timeout = (int)value;
 		
 	} else if(!strcmp(name, "fast-abort-multiplier")) {
 		if(value >= 1) {
